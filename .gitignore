@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.whl
+
+# Local outputs (layercake-generated)
+out/
+out*/
+layers/
+*.png.backup
+points.json
+snippet.html
+
+# Editor & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Model / cache
+.huggingface/
+*.pt
+*.ckpt
+
+# Gradio
+gradio_cached_examples/
+flagged/

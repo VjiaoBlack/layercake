@@ -1,0 +1,27 @@
+# Python 3.10+ required (sam2 drops 3.9).
+# Install with: uv pip install -r requirements.txt
+#   or:        pip install -r requirements.txt
+
+# Core
+numpy>=1.26,<3
+pillow>=10.2
+
+# Torch + vision (Apple-silicon wheels come with MPS support out of the box)
+torch>=2.4
+torchvision>=0.19
+
+# SAM 2 — Meta official. Pulls hydra-core, iopath, etc. as transitive deps.
+# Weights auto-download from HF (facebook/sam2-hiera-large) on first call.
+sam2 @ git+https://github.com/facebookresearch/sam2.git@main
+
+# Depth Anything V2 (optional — guarded at runtime if absent).
+transformers>=4.45
+accelerate>=0.33
+huggingface_hub>=0.24
+
+# Alpha matting for soft edges (--edges matting). Pulls numba + scipy.
+pymatting>=1.1
+scipy>=1.11
+
+# Interactive UI (layers_app.py — optional).
+gradio>=4.44

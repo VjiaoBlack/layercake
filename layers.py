@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+layercake — cut a source photo into depth-ordered transparent PNG layers using SAM 2.
+
+Every output PNG has the *source image's exact dimensions* so the layers stack cleanly
+under CSS `object-fit: cover; object-position: center`. That's the whole point.
+
+Example:
+    python layers.py input.jpg --layers '[
+      {"name": "foreground", "points": [[1200, 300], [850, 250]]},
+      {"name": "subject",    "points": [[420, 400]]},
+      {"name": "midground",  "points": [[1100, 800], [950, 950]]}
+    ]' --out layers/
+
+Depth order is the list order: the FIRST layer is treated as the nearest (rendered on
+top), the LAST layer as the farthest before the inverse-union background. Earlier
+layers occlude later layers in their overlap regions (because they're "in front").
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+
+@dataclass
+class LayerSpec:
+    name: str
+    points: list[list[float]]
+    labels: Optional[list[int]] = None   # per-point label: 1=include, 0=exclude
+    box: Optional[list[float]] = None    # [x1, y1, x2, y2] axis-aligned
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LayerSpec":
+        pts = d.get("points") or []
+        box = d.get("box")
+        if not pts and not box:
+            raise ValueError(f"layer {d.get('name')!r}: must have points or box")
+        labels = d.get("labels")
+        if labels is not None and len(labels) != len(pts):
+            raise ValueError(
+                f"layer {d.get('name')!r}: labels length {len(labels)} "
+                f"must match points length {len(pts)}"
+            )
+        if box is not None and len(box) != 4:
+            raise ValueError(f"layer {d.get('name')!r}: box must be [x1,y1,x2,y2]")
+        return cls(name=d["name"], points=pts, labels=labels, box=box)
+
+
+def detect_device(requested: str) -> str:
+    import torch
+
+    if requested != "auto":
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_sam2_predictor(model: str, device: str):
+    """Load SAM 2 image predictor. Weights auto-download from HF on first run."""
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    hf_id = model if "/" in model else f"facebook/{model}"
+    predictor = SAM2ImagePredictor.from_pretrained(hf_id, device=device)
+    return predictor
+
+
+def segment_layer(
+    predictor,
+    layer: LayerSpec,
+    img_wh: tuple[int, int],
+    return_soft: bool = False,
+) -> np.ndarray:
+    """
+    Return a HxW mask at source image dimensions. Honors the layer's points,
+    labels, and optional axis-aligned box prompt.
+
+    If return_soft is False (default), returns a bool mask.
+    If return_soft is True, returns a float32 array in [0, 1] from SAM 2's
+    sigmoid(logits) — use this for slightly softer edges out of the gate.
+    """
+    W, H = img_wh
+    pts_list = layer.points or []
+    has_pts = len(pts_list) > 0
+    pts = np.asarray(pts_list, dtype=np.float32) if has_pts else None
+    if has_pts:
+        if layer.labels is None:
+            lbls = np.ones(len(pts_list), dtype=np.int32)
+        else:
+            lbls = np.asarray(layer.labels, dtype=np.int32)
+    else:
+        lbls = None
+    box = np.asarray(layer.box, dtype=np.float32) if layer.box is not None else None
+
+    masks, scores, _ = predictor.predict(
+        point_coords=pts,
+        point_labels=lbls,
+        box=box,
+        multimask_output=True,
+        return_logits=return_soft,
+    )
+    best = int(np.argmax(scores))
+    m = np.asarray(masks[best])
+    if m.shape != (H, W):
+        raise RuntimeError(
+            f"SAM 2 returned mask {m.shape}, expected ({H}, {W}). "
+            "Check that the predictor was set on the correct image."
+        )
+    if return_soft:
+        return (1.0 / (1.0 + np.exp(-m.astype(np.float32)))).astype(np.float32)
+    return m.astype(bool)
+
+
+def feather_alpha(alpha: np.ndarray, radius: int) -> np.ndarray:
+    """Feather a uint8 alpha channel by `radius` pixels via PIL GaussianBlur."""
+    if radius <= 0:
+        return alpha
+    im = Image.fromarray(alpha, mode="L").filter(ImageFilter.GaussianBlur(radius=radius))
+    return np.asarray(im)
+
+
+def matting_refine(
+    rgb: np.ndarray,
+    hard_mask: np.ndarray,
+    band_px: int = 8,
+) -> np.ndarray:
+    """
+    Refine a hard bool mask into a soft float32 alpha via closed-form matting.
+
+    Builds a trimap: known-fg = erode(mask, band), known-bg = dilate(mask, band)^c,
+    unknown = the band between them. Solves soft alpha in the unknown band so the
+    boundary respects image edges (hair, thin filaments, fur).
+
+    Requires `pymatting` and `scipy`. Raises ImportError if unavailable.
+    """
+    from pymatting import estimate_alpha_cf  # type: ignore
+    from scipy.ndimage import binary_erosion, binary_dilation  # type: ignore
+
+    fg = binary_erosion(hard_mask, iterations=band_px)
+    bg_not = binary_dilation(hard_mask, iterations=band_px)
+    trimap = np.full(hard_mask.shape, 0.5, dtype=np.float64)
+    trimap[fg] = 1.0
+    trimap[~bg_not] = 0.0
+    img_f = rgb.astype(np.float64) / 255.0
+    if img_f.ndim == 3 and img_f.shape[2] == 4:
+        img_f = img_f[..., :3]
+    alpha = estimate_alpha_cf(np.ascontiguousarray(img_f), np.ascontiguousarray(trimap))
+    return alpha.astype(np.float32)
+
+
+def _coerce_alpha(mask_or_alpha: np.ndarray) -> np.ndarray:
+    """Convert bool/uint8/float mask into a float32 alpha array in [0, 1]."""
+    if mask_or_alpha.dtype == bool:
+        return mask_or_alpha.astype(np.float32)
+    if mask_or_alpha.dtype == np.uint8:
+        return mask_or_alpha.astype(np.float32) / 255.0
+    return np.clip(mask_or_alpha.astype(np.float32), 0.0, 1.0)
+
+
+def mask_to_rgba(
+    rgb: np.ndarray,
+    mask_or_alpha: np.ndarray,
+    feather: int = 0,
+) -> Image.Image:
+    """Compose RGB + mask/alpha → RGBA PIL image. Feather is only applied if > 0."""
+    H, W = mask_or_alpha.shape[:2]
+    alpha_f = _coerce_alpha(mask_or_alpha)
+    alpha_u8 = (alpha_f * 255.0).astype(np.uint8)
+    if feather > 0:
+        alpha_u8 = feather_alpha(alpha_u8, feather)
+    out = np.empty((H, W, 4), dtype=np.uint8)
+    out[..., :3] = rgb
+    out[..., 3] = alpha_u8
+    return Image.fromarray(out, mode="RGBA")
+
+
+def run_depth(img: Image.Image, device: str) -> Optional[Image.Image]:
+    """Return a uint8 L-mode depth map at source dims. None if the model isn't installed."""
+    try:
+        from transformers import pipeline  # type: ignore
+    except ImportError:
+        return None
+
+    try:
+        pipe = pipeline(
+            task="depth-estimation",
+            model="depth-anything/Depth-Anything-V2-Small-hf",
+            device=device if device != "mps" else -1,  # pipeline mps can be flaky; fall back
+        )
+    except Exception as e:
+        print(f"[depth] Depth Anything V2 unavailable: {e}", file=sys.stderr)
+        return None
+
+    result = pipe(img)
+    depth = result.get("depth") if isinstance(result, dict) else result[0]["depth"]
+    if not isinstance(depth, Image.Image):
+        depth = Image.fromarray(np.asarray(depth))
+    depth = depth.convert("L").resize(img.size, Image.BICUBIC)
+    return depth
+
+
+PREVIEW_TINTS = [
+    (255, 80, 80),    # red    — nearest
+    (80, 200, 120),   # green
+    (80, 140, 255),   # blue
+    (230, 190, 80),   # amber
+    (200, 100, 230),  # magenta
+    (80, 220, 220),   # cyan
+]
+
+
+def build_preview(rgb: np.ndarray, ordered_layers: list[tuple[str, np.ndarray]]) -> Image.Image:
+    """Tint each layer's region and composite back-to-front onto the source image."""
+    H, W, _ = rgb.shape
+    canvas = Image.fromarray(rgb).convert("RGBA")
+    for idx, (_name, m) in enumerate(reversed(ordered_layers)):
+        tint = PREVIEW_TINTS[(len(ordered_layers) - 1 - idx) % len(PREVIEW_TINTS)]
+        a = _coerce_alpha(m)
+        overlay = np.zeros((H, W, 4), dtype=np.uint8)
+        overlay[..., :3] = tint
+        overlay[..., 3] = (a * 110).astype(np.uint8)
+        canvas = Image.alpha_composite(canvas, Image.fromarray(overlay, "RGBA"))
+    return canvas.convert("RGB")
+
+
+def build_css_snippet(layer_names: list[str], include_bg: bool = True, wordmark: bool = True) -> str:
+    """Return a ready-to-paste HTML+CSS snippet that stacks the output PNGs."""
+    ordered = (["bg"] if include_bg else []) + list(reversed(layer_names))
+    html_lines = ['<div class="hero">']
+    if include_bg:
+        html_lines.append('  <img src="images/bg.png" class="layer l-bg" alt="">')
+    if wordmark:
+        html_lines.append('  <h1 class="hero-wordmark">your wordmark</h1>')
+    for name in list(reversed(layer_names)):
+        safe = name.replace(" ", "-")
+        html_lines.append(f'  <img src="images/{name}.png" class="layer l-{safe}" alt="">')
+    html_lines.append('</div>')
+
+    css_lines = [
+        '.hero { position: relative; isolation: isolate; overflow: hidden; }',
+        '.hero .layer { position: absolute; inset: 0; width: 100%; height: 100%;',
+        '               object-fit: cover; object-position: center; pointer-events: none; }',
+    ]
+    z = 1
+    if include_bg:
+        css_lines.append(f'.hero .l-bg {{ z-index: {z}; }}')
+        z += 1
+    if wordmark:
+        css_lines.append(f'.hero .hero-wordmark {{ z-index: {z}; position: relative; /* your text styles here */ }}')
+        z += 1
+    for name in list(reversed(layer_names)):
+        safe = name.replace(" ", "-")
+        css_lines.append(f'.hero .l-{safe} {{ z-index: {z}; }}')
+        z += 1
+
+    return "<!-- HTML -->\n" + "\n".join(html_lines) + "\n\n/* CSS */\n" + "\n".join(css_lines) + "\n"
+
+
+def parse_layers_arg(spec: str) -> list[LayerSpec]:
+    # Accept either a JSON string or a path to a JSON file.
+    p = Path(spec)
+    raw = p.read_text() if p.exists() else spec
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("--layers must be a JSON list of {name, points} objects")
+    return [LayerSpec.from_dict(d) for d in data]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("image", help="source image (JPEG/PNG)")
+    ap.add_argument("--layers", required=True,
+                    help="JSON string or path to JSON file. List of {name, points, labels?}. "
+                         "Order = depth order (first = nearest).")
+    ap.add_argument("--out", required=True, help="output directory")
+    ap.add_argument("--model", default="sam2-hiera-large",
+                    help="SAM 2 model id. Default: sam2-hiera-large (HF: facebook/sam2-hiera-large)")
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    ap.add_argument("--feather", type=int, default=2, help="Gaussian feather radius (px) for --edges feather")
+    ap.add_argument("--edges", default="feather", choices=["feather", "sam-soft", "matting"],
+                    help="edge quality: feather (hard+blur, fast), sam-soft (SAM's own soft logits), "
+                         "matting (pymatting closed-form, slowest + best on hair/fine edges)")
+    ap.add_argument("--matting-band", type=int, default=8, help="unknown-region band width in px for --edges matting")
+    ap.add_argument("--preview", action="store_true", help="write _preview.png composite")
+    ap.add_argument("--no-depth", action="store_true", help="skip Depth Anything V2")
+    ap.add_argument("--no-bg", action="store_true", help="skip writing bg.png (inverse union)")
+    ap.add_argument("--no-css", action="store_true", help="skip writing snippet.html")
+    args = ap.parse_args()
+
+    src_path = Path(args.image).expanduser()
+    if not src_path.exists():
+        print(f"error: {src_path} not found", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.out).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    layers = parse_layers_arg(args.layers)
+    if not layers:
+        print("error: --layers produced zero layers", file=sys.stderr)
+        return 2
+
+    device = detect_device(args.device)
+    print(f"[device] {device}")
+
+    img = Image.open(src_path).convert("RGB")
+    W, H = img.size
+    rgb = np.asarray(img)
+    print(f"[source] {src_path.name} {W}x{H}")
+
+    print(f"[sam2] loading {args.model} on {device} (weights auto-download on first run)")
+    predictor = load_sam2_predictor(args.model, device)
+    predictor.set_image(rgb)
+
+    # Depth-ordered bool masks first (for exclusivity logic).
+    hard_masks: list[tuple[str, np.ndarray]] = []
+    for layer in layers:
+        print(f"[sam2] segmenting {layer.name!r} from {len(layer.points)} point(s)")
+        m = segment_layer(predictor, layer, (W, H))
+        hard_masks.append((layer.name, m))
+
+    claimed = np.zeros((H, W), dtype=bool)
+    exclusive_bool: list[tuple[str, np.ndarray]] = []
+    for name, m in hard_masks:
+        m_excl = m & ~claimed
+        exclusive_bool.append((name, m_excl))
+        claimed |= m
+
+    # Turn each exclusive hard mask into a final alpha according to --edges.
+    final: list[tuple[str, np.ndarray]] = []
+    for name, m_excl in exclusive_bool:
+        if args.edges == "matting":
+            print(f"[matting] refining {name!r} (band={args.matting_band}px)")
+            try:
+                alpha = matting_refine(rgb, m_excl, band_px=args.matting_band)
+            except ImportError as e:
+                print(f"[matting] unavailable ({e}); falling back to feather", file=sys.stderr)
+                alpha = m_excl
+        elif args.edges == "sam-soft":
+            # Re-run this layer with return_logits and gate by the exclusive hard region
+            # so soft alpha only lives within the pixels this layer owns.
+            layer = next(L for L in layers if L.name == name)
+            soft = segment_layer(predictor, layer, (W, H), return_soft=True)
+            alpha = soft * m_excl.astype(np.float32)
+        else:
+            alpha = m_excl
+        final.append((name, alpha))
+
+    # Write per-layer RGBA PNGs.
+    for name, a in final:
+        feather = args.feather if args.edges == "feather" else 0
+        rgba = mask_to_rgba(rgb, a, feather)
+        out_path = out_dir / f"{name}.png"
+        rgba.save(out_path, optimize=True)
+        a_f = _coerce_alpha(a)
+        coverage = float(a_f.mean())
+        print(f"[write] {out_path.name} size={rgba.size} coverage={coverage*100:.1f}%")
+
+    # Background = inverse of the soft union over all layer alphas. We use the
+    # Porter-Duff "over" inverse so overlapping soft alphas combine correctly.
+    if not args.no_bg:
+        union = np.zeros((H, W), dtype=np.float32)
+        for _name, a in final:
+            union = 1.0 - (1.0 - union) * (1.0 - _coerce_alpha(a))
+        bg_alpha = 1.0 - union
+        feather = args.feather if args.edges == "feather" else 0
+        rgba_bg = mask_to_rgba(rgb, bg_alpha, feather)
+        out_path = out_dir / "bg.png"
+        rgba_bg.save(out_path, optimize=True)
+        print(f"[write] {out_path.name} size={rgba_bg.size} coverage={float(bg_alpha.mean())*100:.1f}%")
+
+    # Depth map.
+    if not args.no_depth:
+        print("[depth] running Depth Anything V2 (small-hf)")
+        d = run_depth(img, device)
+        if d is not None:
+            out_path = out_dir / "depth.png"
+            d.save(out_path, optimize=True)
+            print(f"[write] {out_path.name} size={d.size}")
+        else:
+            print("[depth] skipped (install `transformers` to enable)")
+
+    # Preview composite.
+    if args.preview:
+        preview = build_preview(rgb, final)
+        out_path = out_dir / "_preview.png"
+        preview.save(out_path, optimize=True)
+        print(f"[write] {out_path.name} size={preview.size}")
+
+    # CSS snippet.
+    if not args.no_css:
+        snippet = build_css_snippet([name for name, _ in final], include_bg=not args.no_bg)
+        (out_dir / "snippet.html").write_text(snippet)
+        print(f"[write] snippet.html ({len(final)} layer(s))")
+
+    # Dimension sanity check.
+    ok = True
+    for f in sorted(out_dir.glob("*.png")):
+        with Image.open(f) as im:
+            if im.size != (W, H):
+                ok = False
+                print(f"[FAIL] {f.name} is {im.size}, expected {(W, H)}")
+    if ok:
+        print(f"[ok] all PNGs match source dims {W}x{H}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
