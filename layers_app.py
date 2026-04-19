@@ -53,7 +53,15 @@ STATE: dict = {
     "model_loaded": None,
     "device_resolved": None,
     "rgb": None,
-    "preview_scale": 1.0,         # preview_dim / source_dim; clicks are in preview coords
+    # View transform: the preview shows (origin_x, origin_y, view_w, view_h)
+    # from the source image, scaled by preview_scale. When zoom is off, origin
+    # is (0,0) and view is (W,H). When zoomed, origin is the zoom box's top-left
+    # and view is its dims.
+    "preview_origin": (0, 0),
+    "preview_scale": 1.0,
+    "zoom_box": None,             # [x1,y1,x2,y2] in SOURCE coords, or None
+    "awaiting_zoom": False,       # True while capturing 2 clicks to define a zoom box
+    "pending_zoom_corner": None,  # [x, y] in SOURCE coords, after 1st zoom click
     "cached_masks": {},
     "pending_box_corner": None,   # [x, y] in SOURCE coords, awaiting 2nd box click
     "move_selected": None,        # (layer_name, point_idx) awaiting drop
@@ -139,11 +147,27 @@ def _render(layers_state: list[dict], active_idx: int) -> Optional[np.ndarray]:
                              outline=(255, 220, 60, 255), width=max(3, r // 2))
             draw.ellipse((x - r, y - r, x + r, y + r),
                          fill=fill, outline=(255, 255, 255, 255), width=2)
-    # Downscale to preview size. Clicks will come back in preview coords and get
-    # rescaled by STATE["preview_scale"] before segmentation.
-    scale = STATE["preview_scale"]
+    # Draw the pending zoom corner if we're mid-capture (always in source coords).
+    if STATE["pending_zoom_corner"] is not None and 0 <= active_idx < len(layers_state):
+        # (We draw the corner indicator regardless of active layer so it's visible.)
+        pass  # drawn below, outside the active-layer branch
+
+    if STATE["pending_zoom_corner"] is not None:
+        draw2 = ImageDraw.Draw(canvas)
+        r = max(6, min(W, H) // 180)
+        x, y = STATE["pending_zoom_corner"]
+        draw2.ellipse((x - r, y - r, x + r, y + r),
+                      fill=(120, 200, 255, 255),
+                      outline=(255, 255, 255, 255), width=2)
+
+    # Crop to the zoomed view (if any), then scale to preview dims.
+    ox, oy, view_w, view_h, scale = _view_transform()
+    STATE["preview_origin"] = (ox, oy)
+    STATE["preview_scale"] = scale
+    if STATE["zoom_box"] is not None:
+        canvas = canvas.crop((ox, oy, ox + view_w, oy + view_h))
     if scale < 1.0:
-        pw, ph = int(round(W * scale)), int(round(H * scale))
+        pw, ph = int(round(view_w * scale)), int(round(view_h * scale))
         canvas = canvas.resize((pw, ph), Image.BILINEAR)
     return np.asarray(canvas.convert("RGB"))
 
@@ -153,6 +177,30 @@ def _compute_preview_scale(W: int, H: int) -> float:
     if longest <= PREVIEW_MAX_DIM:
         return 1.0
     return PREVIEW_MAX_DIM / float(longest)
+
+
+def _view_transform() -> tuple[int, int, int, int, float]:
+    """
+    Return (origin_x, origin_y, view_w, view_h, scale) where (ox, oy) is the
+    top-left of what's currently shown in preview space (in source coords),
+    (view_w, view_h) is the source-space size shown, and scale maps source
+    pixels to preview pixels.
+    """
+    rgb = STATE["rgb"]
+    if rgb is None:
+        return (0, 0, 0, 0, 1.0)
+    H, W, _ = rgb.shape
+    if STATE["zoom_box"] is None:
+        return (0, 0, W, H, _compute_preview_scale(W, H))
+    x1, y1, x2, y2 = [int(round(v)) for v in STATE["zoom_box"]]
+    x1 = max(0, min(W - 1, x1))
+    y1 = max(0, min(H - 1, y1))
+    x2 = max(x1 + 1, min(W, x2))
+    y2 = max(y1 + 1, min(H, y2))
+    view_w, view_h = x2 - x1, y2 - y1
+    longest = max(view_w, view_h)
+    scale = PREVIEW_MAX_DIM / float(longest) if longest > PREVIEW_MAX_DIM else 1.0
+    return (x1, y1, view_w, view_h, scale)
 
 
 REFINE_BAND_PX = 12
@@ -271,6 +319,9 @@ def on_upload(image, model, device, _layers_state):
     STATE["cached_masks"] = {}
     STATE["pending_box_corner"] = None
     STATE["move_selected"] = None
+    STATE["zoom_box"] = None
+    STATE["awaiting_zoom"] = False
+    STATE["pending_zoom_corner"] = None
     H, W, _ = rgb.shape
     STATE["preview_scale"] = _compute_preview_scale(W, H)
     return (_render([], -1), [], gr.update(choices=[], value=None),
@@ -315,18 +366,45 @@ def on_clear_points(active_layer_name, layers_state):
 
 def on_image_click(evt: gr.SelectData, mode, active_layer_name, layers_state):
     if STATE["rgb"] is None:
-        return layers_state, None, "Upload an image first.", []
+        return layers_state, None, "Upload an image first.", [], gr.update()
+    # Preview click → source-image coord via current view transform.
+    ox, oy, _vw, _vh, scale = _view_transform()
+    H, W, _ = STATE["rgb"].shape
+    x = ox + int(round(evt.index[0] / scale))
+    y = oy + int(round(evt.index[1] / scale))
+    x = max(0, min(W - 1, x))
+    y = max(0, min(H - 1, y))
+
+    # If we're mid-capture for a zoom box, intercept before normal mode dispatch.
+    if STATE["awaiting_zoom"]:
+        idx_a = _find_idx(layers_state, active_layer_name)
+        layer_a = layers_state[idx_a] if idx_a >= 0 else None
+        if STATE["pending_zoom_corner"] is None:
+            STATE["pending_zoom_corner"] = [x, y]
+            return (layers_state, _render(layers_state, idx_a),
+                    "Zoom: first corner set. Click the opposite corner.",
+                    _layer_to_df(layer_a), gr.update())
+        px, py = STATE["pending_zoom_corner"]
+        STATE["pending_zoom_corner"] = None
+        STATE["awaiting_zoom"] = False
+        # Minimum zoom size guard (40 px on a side).
+        zx1, zy1 = min(px, x), min(py, y)
+        zx2, zy2 = max(px, x), max(py, y)
+        if zx2 - zx1 < 40 or zy2 - zy1 < 40:
+            STATE["zoom_box"] = None
+            return (layers_state, _render(layers_state, idx_a),
+                    "Zoom cancelled (box too small, need ≥40 px on each side).",
+                    _layer_to_df(layer_a), gr.update(value="Zoom to region"))
+        STATE["zoom_box"] = [float(zx1), float(zy1), float(zx2), float(zy2)]
+        return (layers_state, _render(layers_state, idx_a),
+                f"Zoomed to {zx2-zx1}×{zy2-zy1} px. Click mode = {mode} — clicks now "
+                f"land with source-pixel precision. Hit Exit zoom to return.",
+                _layer_to_df(layer_a), gr.update(value="Exit zoom"))
+
     idx = _find_idx(layers_state, active_layer_name)
     if idx < 0:
         return layers_state, _render(layers_state, -1), "Add and select a layer first.", []
     layer = layers_state[idx]
-    scale = STATE["preview_scale"]
-    # evt.index is in preview coords; divide by scale to get source-image pixels.
-    x = int(round(evt.index[0] / scale))
-    y = int(round(evt.index[1] / scale))
-    H, W, _ = STATE["rgb"].shape
-    x = max(0, min(W - 1, x))
-    y = max(0, min(H - 1, y))
 
     if mode in ("include", "exclude"):
         lbl = 1 if mode == "include" else 0
@@ -404,7 +482,7 @@ def on_image_click(evt: gr.SelectData, mode, active_layer_name, layers_state):
             msg = "Erase: no nearby point or box."
     else:
         msg = f"Unknown mode {mode!r}"
-    return layers_state, _render(layers_state, idx), msg, _layer_to_df(layer)
+    return layers_state, _render(layers_state, idx), msg, _layer_to_df(layer), gr.update()
 
 
 def _inside_box(box: list[float], x: float, y: float) -> bool:
@@ -449,6 +527,23 @@ def on_mode_change(_mode, active_layer_name, layers_state):
     STATE["move_selected"] = None
     idx = _find_idx(layers_state, active_layer_name)
     return _render(layers_state, idx)
+
+
+def on_zoom_button(active_layer_name, layers_state):
+    """Toggle: start zoom-box capture, or exit an active zoom."""
+    idx = _find_idx(layers_state, active_layer_name)
+    if STATE["zoom_box"] is not None:
+        STATE["zoom_box"] = None
+        STATE["awaiting_zoom"] = False
+        STATE["pending_zoom_corner"] = None
+        return (_render(layers_state, idx),
+                gr.update(value="Zoom to region"),
+                "Zoomed out.")
+    STATE["awaiting_zoom"] = True
+    STATE["pending_zoom_corner"] = None
+    return (_render(layers_state, idx),
+            gr.update(value="Cancel zoom"),
+            "Zoom: click two opposite corners on the canvas to define the zoomed region.")
 
 
 def on_points_df_change(df_rows, active_layer_name, layers_state):
@@ -695,6 +790,8 @@ def build_ui(args):
                     interactive=False,
                     elem_classes=["big-preview"],
                 )
+                with gr.Row():
+                    zoom_btn = gr.Button("Zoom to region", size="sm")
                 status = gr.Markdown("Upload an image to begin.")
                 output_composite = gr.Image(
                     label="Output composite (how the CSS stack will render — updates on Save)",
@@ -717,7 +814,9 @@ def build_ui(args):
                             [preview, points_df])
         point_mode.change(on_mode_change, [point_mode, active_layer, layers_state], [preview])
         preview.select(on_image_click, [point_mode, active_layer, layers_state],
-                       [layers_state, preview, status, points_df])
+                       [layers_state, preview, status, points_df, zoom_btn])
+        zoom_btn.click(on_zoom_button, [active_layer, layers_state],
+                       [preview, zoom_btn, status])
         points_df.input(on_points_df_change, [points_df, active_layer, layers_state],
                         [layers_state, preview, status])
         save_btn.click(on_save,
