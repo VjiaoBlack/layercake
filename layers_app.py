@@ -44,14 +44,17 @@ LAYER_COLORS = [
     (80, 220, 220),
 ]
 
+PREVIEW_MAX_DIM = 1280  # longest edge of the click canvas; source is always full-res
+
 STATE: dict = {
     "predictor": None,
     "model_loaded": None,
     "device_resolved": None,
     "rgb": None,
+    "preview_scale": 1.0,         # preview_dim / source_dim; clicks are in preview coords
     "cached_masks": {},
-    "pending_box_corner": None,   # [x, y] when awaiting the second box click
-    "move_selected": None,         # (layer_name, point_idx) when awaiting drop
+    "pending_box_corner": None,   # [x, y] in SOURCE coords, awaiting 2nd box click
+    "move_selected": None,        # (layer_name, point_idx) awaiting drop
 }
 
 
@@ -86,6 +89,7 @@ def _segment(layer: dict) -> Optional[np.ndarray]:
 
 
 def _render(layers_state: list[dict], active_idx: int) -> Optional[np.ndarray]:
+    """Compose preview at full source dims then downscale to PREVIEW_MAX_DIM for speed."""
     rgb = STATE["rgb"]
     if rgb is None:
         return None
@@ -125,7 +129,20 @@ def _render(layers_state: list[dict], active_idx: int) -> Optional[np.ndarray]:
                              outline=(255, 220, 60, 255), width=max(3, r // 2))
             draw.ellipse((x - r, y - r, x + r, y + r),
                          fill=fill, outline=(255, 255, 255, 255), width=2)
+    # Downscale to preview size. Clicks will come back in preview coords and get
+    # rescaled by STATE["preview_scale"] before segmentation.
+    scale = STATE["preview_scale"]
+    if scale < 1.0:
+        pw, ph = int(round(W * scale)), int(round(H * scale))
+        canvas = canvas.resize((pw, ph), Image.BILINEAR)
     return np.asarray(canvas.convert("RGB"))
+
+
+def _compute_preview_scale(W: int, H: int) -> float:
+    longest = max(W, H)
+    if longest <= PREVIEW_MAX_DIM:
+        return 1.0
+    return PREVIEW_MAX_DIM / float(longest)
 
 
 def _find_idx(layers_state: list[dict], name: Optional[str]) -> int:
@@ -205,9 +222,13 @@ def on_upload(image, model, device, _layers_state):
     STATE["rgb"] = rgb
     STATE["cached_masks"] = {}
     STATE["pending_box_corner"] = None
+    STATE["move_selected"] = None
     H, W, _ = rgb.shape
-    return (rgb, [], gr.update(choices=[], value=None),
-            f"Loaded {W}×{H} on {device_resolved} ({model}). Add a layer to start.", [])
+    STATE["preview_scale"] = _compute_preview_scale(W, H)
+    return (_render([], -1), [], gr.update(choices=[], value=None),
+            f"Loaded {W}×{H} on {device_resolved} ({model}). "
+            f"Preview @ {int(W*STATE['preview_scale'])}×{int(H*STATE['preview_scale'])}. "
+            f"Add a layer to start.", [])
 
 
 def on_add_layer(new_name, layers_state):
@@ -251,8 +272,13 @@ def on_image_click(evt: gr.SelectData, mode, active_layer_name, layers_state):
     if idx < 0:
         return layers_state, _render(layers_state, -1), "Add and select a layer first.", []
     layer = layers_state[idx]
-    x, y = int(evt.index[0]), int(evt.index[1])
+    scale = STATE["preview_scale"]
+    # evt.index is in preview coords; divide by scale to get source-image pixels.
+    x = int(round(evt.index[0] / scale))
+    y = int(round(evt.index[1] / scale))
     H, W, _ = STATE["rgb"].shape
+    x = max(0, min(W - 1, x))
+    y = max(0, min(H - 1, y))
 
     if mode in ("include", "exclude"):
         lbl = 1 if mode == "include" else 0
