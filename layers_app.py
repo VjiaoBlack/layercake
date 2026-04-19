@@ -79,15 +79,26 @@ def _load_predictor(model: str, device: str):
 
 
 def _new_layer(name: str) -> dict:
+    # SAM 2 returns 3 candidate masks per predict() call at subpart/part/whole
+    # scale. We store all of them so the user can cycle through alternates.
     # refined_regions: list of {"box": [x1,y1,x2,y2], "alpha": np.ndarray}
-    # Each region carries a soft alpha in box-local coords; applied at save time.
-    return {"name": name, "points": [], "labels": [], "box": None,
-            "history": [], "refined_regions": []}
+    return {
+        "name": name, "points": [], "labels": [], "box": None,
+        "history": [], "refined_regions": [],
+        "candidates": [], "candidate_scores": [], "active_candidate": 0,
+    }
 
 
 def _segment(layer: dict) -> Optional[np.ndarray]:
-    """Run SAM 2 on an active layer's prompts. None if nothing to segment."""
+    """
+    Run SAM 2 on an active layer's prompts. Populates `layer["candidates"]` with
+    all three scale-variant masks (sorted by score, highest first). Returns the
+    currently-active candidate, or None if nothing to segment.
+    """
     if not layer["points"] and layer["box"] is None:
+        layer["candidates"] = []
+        layer["candidate_scores"] = []
+        layer["active_candidate"] = 0
         return None
     predictor = STATE["predictor"]
     pts = np.asarray(layer["points"], dtype=np.float32) if layer["points"] else None
@@ -97,8 +108,13 @@ def _segment(layer: dict) -> Optional[np.ndarray]:
         masks, scores, _ = predictor.predict(
             point_coords=pts, point_labels=lbls, box=box, multimask_output=True,
         )
-    best = int(np.argmax(scores))
-    return np.asarray(masks[best]).astype(bool)
+    order = np.argsort(-np.asarray(scores))  # best first
+    layer["candidates"] = [np.asarray(masks[i]).astype(bool) for i in order]
+    layer["candidate_scores"] = [float(scores[i]) for i in order]
+    # Reset to best candidate whenever prompts change — the previous alternate
+    # index may not mean the same thing under a new prompt set.
+    layer["active_candidate"] = 0
+    return layer["candidates"][0]
 
 
 def _render(layers_state: list[dict], active_idx: int) -> Optional[np.ndarray]:
@@ -529,6 +545,30 @@ def on_mode_change(_mode, active_layer_name, layers_state):
     return _render(layers_state, idx)
 
 
+def on_cycle_mask(direction, active_layer_name, layers_state):
+    """direction=+1 or -1. Cycles the active layer's SAM candidate."""
+    idx = _find_idx(layers_state, active_layer_name)
+    if idx < 0:
+        return layers_state, _render(layers_state, -1), "No active layer.", []
+    layer = layers_state[idx]
+    cands = layer.get("candidates", [])
+    if not cands:
+        return (layers_state, _render(layers_state, idx),
+                "No candidates yet — add a point or box on this layer first.",
+                _layer_to_df(layer))
+    n = len(cands)
+    layer["active_candidate"] = (layer["active_candidate"] + direction) % n
+    STATE["cached_masks"][layer["name"]] = cands[layer["active_candidate"]]
+    i = layer["active_candidate"]
+    score = layer["candidate_scores"][i]
+    names = ["best", "alt 1", "alt 2"]
+    label = names[i] if i < len(names) else f"alt {i}"
+    return (layers_state, _render(layers_state, idx),
+            f"{layer['name']}: candidate {i+1}/{n} ({label}, score {score:.2f}). "
+            f"SAM returns subpart/part/whole; cycle to pick which you meant.",
+            _layer_to_df(layer))
+
+
 def on_zoom_button(active_layer_name, layers_state):
     """Toggle: start zoom-box capture, or exit an active zoom."""
     idx = _find_idx(layers_state, active_layer_name)
@@ -734,6 +774,9 @@ def build_ui(args):
                     undo_btn = gr.Button("Undo last")
                     clear_btn = gr.Button("Clear layer")
                     remove_btn = gr.Button("Remove layer", variant="stop")
+                with gr.Row():
+                    mask_prev_btn = gr.Button("◀ Try alt mask", size="sm")
+                    mask_next_btn = gr.Button("Try alt mask ▶", size="sm")
 
                 points_df = gr.Dataframe(
                     headers=["x", "y", "±"],
@@ -810,6 +853,12 @@ def build_ui(args):
                         [layers_state, preview, status, points_df])
         undo_btn.click(on_undo, [active_layer, layers_state],
                        [layers_state, preview, status, points_df])
+        mask_prev_btn.click(lambda a, s: on_cycle_mask(-1, a, s),
+                            [active_layer, layers_state],
+                            [layers_state, preview, status, points_df])
+        mask_next_btn.click(lambda a, s: on_cycle_mask(+1, a, s),
+                            [active_layer, layers_state],
+                            [layers_state, preview, status, points_df])
         active_layer.change(on_active_layer_change, [active_layer, layers_state],
                             [preview, points_df])
         point_mode.change(on_mode_change, [point_mode, active_layer, layers_state], [preview])
