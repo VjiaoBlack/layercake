@@ -91,6 +91,133 @@ def load_sam2_predictor(model: str, device: str):
     return predictor
 
 
+# --- SAM 3 concept-segmentation path ---------------------------------------
+#
+# SAM 3 (Nov 2025) introduced Promptable Concept Segmentation: given a short
+# text phrase like "rope" or "face", return masks + boxes + scores for every
+# instance of that concept in the image. This is exactly the capability SAM 2
+# can't give you. We use the HuggingFace transformers integration (avoids the
+# `triton` dep that the official sam3 package needs and macOS doesn't ship).
+#
+# `facebook/sam3` on HuggingFace is a gated model — users must accept terms
+# on the model page and have HF_TOKEN set in their environment. We surface a
+# clear error if auth is missing rather than letting transformers error deep
+# in its innards.
+
+SAM3_AUTH_HINT = (
+    "SAM 3 weights are gated. One-time setup:\n"
+    "  1. Visit https://huggingface.co/facebook/sam3 and click 'Agree and access'.\n"
+    "  2. Create a token at https://huggingface.co/settings/tokens (read scope).\n"
+    "  3. Export HF_TOKEN=hf_xxx  (or run `huggingface-cli login`).\n"
+    "Then relaunch."
+)
+
+
+def load_sam3_concept_pipeline(device: str, model_id: str = "facebook/sam3"):
+    """
+    Load the HuggingFace SAM 3 text-prompted concept segmenter.
+
+    Returns (model, processor) ready to run concept segmentation. Raises
+    ImportError if transformers isn't new enough to have SAM 3, or RuntimeError
+    with a clear message if HF access isn't granted.
+    """
+    try:
+        from transformers import Sam3Model, Sam3Processor  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "transformers is missing SAM 3 support. Upgrade: "
+            "`uv pip install -U transformers`"
+        ) from e
+
+    import os
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+    try:
+        processor = Sam3Processor.from_pretrained(model_id, token=token)
+        model = Sam3Model.from_pretrained(model_id, token=token)
+    except Exception as e:
+        msg = str(e)
+        if "gated" in msg.lower() or "401" in msg or "403" in msg or "access" in msg.lower():
+            raise RuntimeError(f"{msg}\n\n{SAM3_AUTH_HINT}") from e
+        raise
+
+    import torch
+    model.to(device)
+    model.eval()
+    return model, processor
+
+
+def segment_by_concept(
+    model,
+    processor,
+    image: Image.Image,
+    text: str,
+    score_threshold: float = 0.4,
+    max_instances: int = 10,
+) -> list[dict]:
+    """
+    Run SAM 3 concept segmentation: find every instance of `text` in `image`.
+
+    Returns a list of {"mask": bool HxW, "box": [x1,y1,x2,y2], "score": float},
+    sorted best-first and filtered by score_threshold + max_instances.
+    """
+    import torch
+
+    rgb = image.convert("RGB")
+    inputs = processor(images=rgb, text=text, return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+    with torch.inference_mode(), autocast_ctx(str(device).split(":")[0]):
+        outputs = model(**inputs)
+
+    # Post-process to per-instance mask+box+score at source dims.
+    # The processor exposes post_process_instance_segmentation.
+    W, H = rgb.size
+    orig_sizes = [(H, W)]
+    try:
+        results = processor.post_process_instance_segmentation(
+            outputs, target_sizes=orig_sizes, score_thresh=score_threshold,
+        )[0]
+    except Exception:
+        # Fallback: read raw outputs and threshold ourselves.
+        import torch.nn.functional as F
+        pred_masks = outputs.pred_masks[0]  # (N, H', W')
+        pred_boxes = outputs.pred_boxes[0] if hasattr(outputs, "pred_boxes") else None
+        pred_scores = outputs.pred_scores[0] if hasattr(outputs, "pred_scores") else None
+        if pred_scores is None:
+            raise
+        # Keep top-k above threshold
+        keep = pred_scores >= score_threshold
+        pred_masks = pred_masks[keep]
+        pred_scores = pred_scores[keep]
+        # Resize masks to source dims
+        m = F.interpolate(pred_masks.float().unsqueeze(0), size=(H, W),
+                          mode="bilinear", align_corners=False).squeeze(0)
+        results = {
+            "masks": (m > 0).cpu().numpy(),
+            "scores": pred_scores.cpu().numpy(),
+            "boxes": pred_boxes[keep].cpu().numpy() if pred_boxes is not None else None,
+        }
+
+    out = []
+    masks = np.asarray(results["masks"]) if not isinstance(results["masks"], np.ndarray) else results["masks"]
+    scores = np.asarray(results.get("scores", []))
+    boxes = results.get("boxes")
+    if boxes is not None and not isinstance(boxes, np.ndarray):
+        boxes = np.asarray(boxes)
+    order = np.argsort(-scores) if scores.size else range(len(masks))
+    for rank, i in enumerate(order):
+        if rank >= max_instances:
+            break
+        out.append({
+            "mask": np.asarray(masks[i]).astype(bool),
+            "box": boxes[i].tolist() if boxes is not None else None,
+            "score": float(scores[i]) if scores.size else 1.0,
+        })
+    return out
+
+
 def segment_layer(
     predictor,
     layer: LayerSpec,

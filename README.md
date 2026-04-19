@@ -39,6 +39,29 @@ First run downloads SAM 2 weights (~900 MB for `sam2-hiera-large`). Cached
 under `~/.cache/huggingface/`. Device auto-detects MPS (Apple silicon),
 CUDA, or CPU.
 
+## SAM 3 text prompts (optional)
+
+The Gradio UI includes an opt-in **"Segment by concept"** section powered by
+[SAM 3](https://github.com/facebookresearch/sam3) (Nov 2025). Type a short
+noun phrase (`rope`, `face`, `hand`, `leaves`) and SAM 3 segments **every
+instance** of the concept, creating one layer per instance.
+
+This is genuinely additive to SAM 2 — SAM 2 needs you to know where to click;
+SAM 3 takes the concept name and finds it for you. Especially useful for
+scenes where the same thing repeats (multiple rope strands, a crowd, a shelf
+of objects).
+
+**One-time setup (weights are gated):**
+
+1. Visit [huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3)
+   and click *Agree and access repository*.
+2. Create a read-scope token at
+   [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+3. `export HF_TOKEN=hf_...` in your shell, or run `huggingface-cli login`.
+
+Then relaunch layercake. The first concept segmentation downloads the model
+(~3 GB) and caches it under `~/.cache/huggingface/`.
+
 ## Interactive UI (recommended)
 
 ```bash

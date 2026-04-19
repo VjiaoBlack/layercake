@@ -33,8 +33,10 @@ from layers import (
     detect_device,
     infill_background,
     load_sam2_predictor,
+    load_sam3_concept_pipeline,
     mask_to_rgba,
     matting_refine,
+    segment_by_concept,
 )
 
 LAYER_COLORS = [
@@ -52,6 +54,8 @@ STATE: dict = {
     "predictor": None,
     "model_loaded": None,
     "device_resolved": None,
+    "sam3_pipe": None,            # (Sam3Model, Sam3Processor) lazy-loaded
+    "sam3_device": None,
     "rgb": None,
     # View transform: the preview shows (origin_x, origin_y, view_w, view_h)
     # from the source image, scaled by preview_scale. When zoom is off, origin
@@ -545,6 +549,75 @@ def on_mode_change(_mode, active_layer_name, layers_state):
     return _render(layers_state, idx)
 
 
+def _ensure_sam3_pipeline(device_resolved: str):
+    if STATE["sam3_pipe"] is None or STATE["sam3_device"] != device_resolved:
+        model, processor = load_sam3_concept_pipeline(device_resolved)
+        STATE["sam3_pipe"] = (model, processor)
+        STATE["sam3_device"] = device_resolved
+    return STATE["sam3_pipe"]
+
+
+def on_concept_segment(concept_text, device, base_name, score_thresh, layers_state):
+    """
+    Run SAM 3 concept segmentation. Creates one new layer per returned instance
+    named {base_name}-{i} (i=1..N). Adds them to layers_state with a pre-set mask
+    (stored into STATE["cached_masks"]).
+    """
+    if STATE["rgb"] is None:
+        return layers_state, gr.update(), None, "Upload an image first."
+    text = (concept_text or "").strip()
+    if not text:
+        return layers_state, gr.update(), None, "Enter a concept like 'rope' or 'face'."
+    device_resolved = detect_device(device)
+    try:
+        model, processor = _ensure_sam3_pipeline(device_resolved)
+    except (ImportError, RuntimeError) as e:
+        return (layers_state, gr.update(), None,
+                f"**SAM 3 unavailable.** {e}")
+
+    from PIL import Image as PILImage
+    img = PILImage.fromarray(STATE["rgb"])
+    try:
+        results = segment_by_concept(model, processor, img, text,
+                                     score_threshold=float(score_thresh))
+    except Exception as e:
+        return (layers_state, gr.update(), None,
+                f"SAM 3 segmentation failed: {type(e).__name__}: {e}")
+
+    if not results:
+        return (layers_state, gr.update(), None,
+                f"No instances of {text!r} found at score ≥ {score_thresh}. Try a different phrase or lower threshold.")
+
+    base = (base_name or text).strip().replace(" ", "-") or "concept"
+    # Avoid colliding with existing names.
+    existing = {L["name"] for L in layers_state}
+    created = []
+    for i, r in enumerate(results, start=1):
+        name = f"{base}-{i}"
+        n = 1
+        while name in existing:
+            n += 1
+            name = f"{base}-{i}-{n}"
+        existing.add(name)
+        layers_state = layers_state + [{
+            "name": name, "points": [], "labels": [], "box": None,
+            "history": [], "refined_regions": [],
+            "candidates": [r["mask"]], "candidate_scores": [r["score"]],
+            "active_candidate": 0,
+        }]
+        STATE["cached_masks"][name] = r["mask"]
+        created.append((name, r["score"]))
+
+    choices = [L["name"] for L in layers_state]
+    first_name = created[0][0]
+    idx = _find_idx(layers_state, first_name)
+    summary = ", ".join(f"{n} ({s:.2f})" for n, s in created)
+    return (layers_state,
+            gr.update(choices=choices, value=first_name),
+            _render(layers_state, idx),
+            f"SAM 3 created {len(created)} layer(s) for {text!r}: {summary}")
+
+
 def on_cycle_mask(direction, active_layer_name, layers_state):
     """direction=+1 or -1. Cycles the active layer's SAM candidate."""
     idx = _find_idx(layers_state, active_layer_name)
@@ -758,6 +831,20 @@ def build_ui(args):
             with gr.Column(scale=1):
                 image_in = gr.Image(type="pil", label="Source image", height=220)
 
+                with gr.Accordion("Segment by concept (SAM 3, text prompt)", open=False):
+                    gr.Markdown(
+                        "Type a short noun phrase — `rope`, `face`, `hand` — and SAM 3 "
+                        "segments **all instances** of it, creating one layer per instance. "
+                        "Gated model: requires `HF_TOKEN` + one-time access approval at "
+                        "[huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3)."
+                    )
+                    with gr.Row():
+                        concept_text = gr.Textbox(label="Concept", placeholder="rope", scale=2)
+                        concept_base = gr.Textbox(label="Layer name prefix", placeholder="(defaults to concept)", scale=2)
+                    concept_thresh = gr.Slider(0.1, 0.9, value=0.4, step=0.05,
+                                               label="Score threshold (higher = fewer, higher-confidence instances)")
+                    concept_btn = gr.Button("Segment by concept", variant="primary", size="sm")
+
                 gr.Markdown("### Layers")
                 with gr.Row():
                     new_name = gr.Textbox(label="New layer name", placeholder="subject", scale=2)
@@ -847,6 +934,9 @@ def build_ui(args):
                         [preview, layers_state, active_layer, status, points_df])
         add_btn.click(on_add_layer, [new_name, layers_state],
                       [layers_state, active_layer, new_name, status])
+        concept_btn.click(on_concept_segment,
+                          [concept_text, device, concept_base, concept_thresh, layers_state],
+                          [layers_state, active_layer, preview, status])
         remove_btn.click(on_remove_layer, [active_layer, layers_state],
                         [layers_state, active_layer, preview, status, points_df])
         clear_btn.click(on_clear_points, [active_layer, layers_state],

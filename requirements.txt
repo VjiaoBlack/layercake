@@ -14,10 +14,12 @@ torchvision>=0.19
 # Weights auto-download from HF (facebook/sam2-hiera-large) on first call.
 sam2 @ git+https://github.com/facebookresearch/sam2.git@main
 
-# Depth Anything V2 (optional — guarded at runtime if absent).
-transformers>=4.45
+# Depth Anything V2 + SAM 3 (via HF transformers). SAM 3 needs recent
+# transformers with Sam3Model/Sam3Processor — bump if yours is older.
+transformers>=4.60
 accelerate>=0.33
 huggingface_hub>=0.24
+einops>=0.7  # transitive for SAM 3
 
 # Alpha matting for soft edges (--edges matting). Pulls numba + scipy.
 pymatting>=1.1
