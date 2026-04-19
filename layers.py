@@ -195,6 +195,50 @@ def matting_refine(
     return alpha.astype(np.float32)
 
 
+def infill_background(
+    rgb: np.ndarray,
+    hole_mask: np.ndarray,
+    method: str = "lama",
+) -> np.ndarray:
+    """
+    Fill a "hole" region of `rgb` (where hole_mask=True) with plausible content
+    so the resulting image can be used as a full-coverage backdrop behind the
+    foreground layer stack.
+
+    method:
+      - "opencv": cv2.INPAINT_NS (Navier-Stokes). Near-instant, no ML deps.
+                  Good for simple/smooth backgrounds (walls, gradients, sky).
+      - "lama":   LaMa model via `simple-lama-inpainting`. Plausible on
+                  complex scenes; downloads a ~200 MB checkpoint on first use.
+
+    Returns a uint8 (H, W, 3) RGB array at source dims.
+    """
+    if hole_mask.dtype != bool:
+        hole_mask = hole_mask.astype(bool)
+    if method == "opencv":
+        import cv2  # type: ignore
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        mask_u8 = (hole_mask.astype(np.uint8)) * 255
+        filled_bgr = cv2.inpaint(bgr, mask_u8, 5, cv2.INPAINT_NS)
+        return cv2.cvtColor(filled_bgr, cv2.COLOR_BGR2RGB)
+    elif method == "lama":
+        from simple_lama_inpainting import SimpleLama  # type: ignore
+        global _LAMA
+        try:
+            _LAMA  # type: ignore
+        except NameError:
+            _LAMA = SimpleLama()  # type: ignore
+        mask_pil = Image.fromarray((hole_mask.astype(np.uint8)) * 255, mode="L")
+        src_pil = Image.fromarray(rgb, mode="RGB")
+        filled = _LAMA(src_pil, mask_pil)
+        return np.asarray(filled.convert("RGB"))
+    else:
+        raise ValueError(f"unknown infill method {method!r}")
+
+
+_LAMA = None  # cache the SimpleLama instance
+
+
 def _coerce_alpha(mask_or_alpha: np.ndarray) -> np.ndarray:
     """Convert bool/uint8/float mask into a float32 alpha array in [0, 1]."""
     if mask_or_alpha.dtype == bool:
@@ -335,6 +379,10 @@ def main() -> int:
     ap.add_argument("--no-depth", action="store_true", help="skip Depth Anything V2")
     ap.add_argument("--no-bg", action="store_true", help="skip writing bg.png (inverse union)")
     ap.add_argument("--no-css", action="store_true", help="skip writing snippet.html")
+    ap.add_argument("--infill", default="none", choices=["none", "opencv", "lama"],
+                    help="fill the bg hole (where foreground layers sit) with plausible content. "
+                         "opencv = Navier-Stokes (instant, simple bgs). lama = LaMa model (better, ~200MB). "
+                         "When set, bg.png is opaque everywhere and contains the infilled backdrop.")
     args = ap.parse_args()
 
     src_path = Path(args.image).expanduser()
@@ -412,12 +460,22 @@ def main() -> int:
         union = np.zeros((H, W), dtype=np.float32)
         for _name, a in final:
             union = 1.0 - (1.0 - union) * (1.0 - _coerce_alpha(a))
-        bg_alpha = 1.0 - union
-        feather = args.feather if args.edges == "feather" else 0
-        rgba_bg = mask_to_rgba(rgb, bg_alpha, feather)
-        out_path = out_dir / "bg.png"
-        rgba_bg.save(out_path, optimize=True)
-        print(f"[write] {out_path.name} size={rgba_bg.size} coverage={float(bg_alpha.mean())*100:.1f}%")
+        if args.infill == "none":
+            bg_alpha = 1.0 - union
+            feather = args.feather if args.edges == "feather" else 0
+            rgba_bg = mask_to_rgba(rgb, bg_alpha, feather)
+            out_path = out_dir / "bg.png"
+            rgba_bg.save(out_path, optimize=True)
+            print(f"[write] {out_path.name} size={rgba_bg.size} coverage={float(bg_alpha.mean())*100:.1f}%")
+        else:
+            hole = union > 0.5  # binary hole where foreground sits
+            print(f"[infill] {args.infill} filling {float(hole.mean())*100:.1f}% of frame")
+            filled_rgb = infill_background(rgb, hole, method=args.infill)
+            opaque_alpha = np.ones((H, W), dtype=np.float32)
+            rgba_bg = mask_to_rgba(filled_rgb, opaque_alpha, 0)
+            out_path = out_dir / "bg.png"
+            rgba_bg.save(out_path, optimize=True)
+            print(f"[write] {out_path.name} size={rgba_bg.size} (infilled, opaque)")
 
     # Depth map.
     if not args.no_depth:

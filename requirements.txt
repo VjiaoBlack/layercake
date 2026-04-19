@@ -23,5 +23,9 @@ huggingface_hub>=0.24
 pymatting>=1.1
 scipy>=1.11
 
+# Background infill (--infill opencv/lama). Import-guarded at runtime.
+opencv-python-headless>=4.8
+simple-lama-inpainting>=0.1
+
 # Interactive UI (layers_app.py — optional).
 gradio>=4.44

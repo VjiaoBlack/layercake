@@ -31,6 +31,7 @@ from layers import (
     autocast_ctx,
     build_css_snippet,
     detect_device,
+    infill_background,
     load_sam2_predictor,
     mask_to_rgba,
     matting_refine,
@@ -400,7 +401,7 @@ def on_points_df_change(df_rows, active_layer_name, layers_state):
     return layers_state, _render(layers_state, idx), f"{layer['name']}: {_prompt_summary(layer)}"
 
 
-def on_save(out_dir, edges, feather, matting_band, matting_algo, include_bg, include_css, layers_state):
+def on_save(out_dir, edges, feather, matting_band, matting_algo, infill, include_bg, include_css, layers_state):
     if STATE["rgb"] is None:
         return "No image loaded.", ""
     if not layers_state:
@@ -443,9 +444,14 @@ def on_save(out_dir, edges, feather, matting_band, matting_algo, include_bg, inc
         union = np.zeros((H, W), dtype=np.float32)
         for _n, a in finals:
             union = 1.0 - (1.0 - union) * (1.0 - _coerce_alpha(a))
-        bg_alpha = 1.0 - union
-        fe = int(feather) if edges == "feather" else 0
-        rgba = mask_to_rgba(rgb, bg_alpha, fe)
+        if infill == "none":
+            bg_alpha = 1.0 - union
+            fe = int(feather) if edges == "feather" else 0
+            rgba = mask_to_rgba(rgb, bg_alpha, fe)
+        else:
+            hole = union > 0.5
+            filled_rgb = infill_background(rgb, hole, method=infill)
+            rgba = mask_to_rgba(filled_rgb, np.ones((H, W), dtype=np.float32), 0)
         p = out / "bg.png"
         rgba.save(p, optimize=True)
         written.append(p.name)
@@ -539,6 +545,12 @@ def build_ui(args):
                     info="cf = default (measured fastest + highest quality). "
                          "lbdm/knn = alternatives for very large unknown regions.",
                 )
+                infill = gr.Dropdown(
+                    ["none", "opencv", "lama"], value="none", label="Background infill",
+                    info="none = bg.png is the inverse union. opencv = Navier-Stokes inpaint "
+                         "(instant, best on simple bgs). lama = LaMa model (plausible on complex "
+                         "scenes, downloads ~200MB on first use).",
+                )
                 with gr.Row():
                     include_bg = gr.Checkbox(value=True, label="Write bg.png")
                     include_css = gr.Checkbox(value=True, label="Write snippet.html")
@@ -575,7 +587,8 @@ def build_ui(args):
         points_df.input(on_points_df_change, [points_df, active_layer, layers_state],
                         [layers_state, preview, status])
         save_btn.click(on_save,
-                       [out_dir, edges, feather, matting_band, matting_algo, include_bg, include_css, layers_state],
+                       [out_dir, edges, feather, matting_band, matting_algo, infill,
+                        include_bg, include_css, layers_state],
                        [status, css_out])
         export_btn.click(on_export_spec, [layers_state], [spec_out])
 

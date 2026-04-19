@@ -105,6 +105,7 @@ from the UI).
 | `--no-bg` | off | Skip `bg.png` |
 | `--no-depth` | off | Skip the Depth Anything V2 depth map |
 | `--no-css` | off | Skip `snippet.html` |
+| `--infill` | `none` | Fill the bg "hole" where layers sit: `none`, `opencv` (Navier-Stokes, instant), `lama` (LaMa model, ~200 MB, plausible on complex scenes) |
 
 ### Depth map (optional)
 
@@ -133,6 +134,26 @@ structures or motion blur.
 and highest quality on typical problems), `lbdm` (approximation for very
 large unknown regions), `knn` (alternative kernel, sometimes useful on
 fur).
+
+## Background infill
+
+By default `bg.png` has a transparent "hole" where your foreground layers
+sit — perfect for CSS stacking since the foreground layer sits on top and
+fills the hole visually.
+
+If you want the bg as a standalone complete image (e.g., for parallax where
+the foreground slides and the exposed bg should look plausible), use
+`--infill`:
+
+- `--infill opencv` — OpenCV Navier-Stokes inpainting. Near-instant, zero
+  extra deps beyond `opencv-python-headless`. Works well on simple
+  backdrops (walls, gradients, out-of-focus surfaces).
+- `--infill lama` — [LaMa](https://github.com/advimman/lama) model via
+  `simple-lama-inpainting`. Plausible on complex scenes; first use
+  downloads ~200 MB; inference is a few seconds.
+
+Output `bg.png` becomes fully opaque (alpha=1 everywhere) and contains the
+infilled backdrop.
 
 ## CSS integration
 
