@@ -152,18 +152,36 @@ def matting_refine(
     rgb: np.ndarray,
     hard_mask: np.ndarray,
     band_px: int = 8,
+    algo: str = "cf",
 ) -> np.ndarray:
     """
-    Refine a hard bool mask into a soft float32 alpha via closed-form matting.
+    Refine a hard bool mask into a soft float32 alpha via alpha matting.
 
     Builds a trimap: known-fg = erode(mask, band), known-bg = dilate(mask, band)^c,
     unknown = the band between them. Solves soft alpha in the unknown band so the
     boundary respects image edges (hair, thin filaments, fur).
 
+    algo:
+      - "cf"   (default): Closed-form matting — near-gold-standard quality,
+                fastest in practice on small-to-moderate unknown regions.
+      - "lbdm": Learning-Based Digital — approximation designed for large
+                unknown regions; has heavier setup so often slower on typical
+                problem sizes. Try when cf struggles on huge complex edges.
+      - "knn":  KNN matting — different kernel, sometimes useful on textured fur.
+
     Requires `pymatting` and `scipy`. Raises ImportError if unavailable.
     """
-    from pymatting import estimate_alpha_cf  # type: ignore
+    import pymatting  # type: ignore
     from scipy.ndimage import binary_erosion, binary_dilation  # type: ignore
+
+    solvers = {
+        "lbdm": pymatting.estimate_alpha_lbdm,
+        "cf": pymatting.estimate_alpha_cf,
+        "knn": pymatting.estimate_alpha_knn,
+    }
+    solve = solvers.get(algo)
+    if solve is None:
+        raise ValueError(f"unknown matting algo {algo!r}; choose {sorted(solvers)}")
 
     fg = binary_erosion(hard_mask, iterations=band_px)
     bg_not = binary_dilation(hard_mask, iterations=band_px)
@@ -173,7 +191,7 @@ def matting_refine(
     img_f = rgb.astype(np.float64) / 255.0
     if img_f.ndim == 3 and img_f.shape[2] == 4:
         img_f = img_f[..., :3]
-    alpha = estimate_alpha_cf(np.ascontiguousarray(img_f), np.ascontiguousarray(trimap))
+    alpha = solve(np.ascontiguousarray(img_f), np.ascontiguousarray(trimap))
     return alpha.astype(np.float32)
 
 
@@ -310,6 +328,9 @@ def main() -> int:
                     help="edge quality: feather (hard+blur, fast), sam-soft (SAM's own soft logits), "
                          "matting (pymatting closed-form, slowest + best on hair/fine edges)")
     ap.add_argument("--matting-band", type=int, default=8, help="unknown-region band width in px for --edges matting")
+    ap.add_argument("--matting-algo", default="cf", choices=["cf", "lbdm", "knn"],
+                    help="matting solver: cf (default, measured fastest + highest quality on typical "
+                         "problems), lbdm (approximation for very large unknown regions), knn")
     ap.add_argument("--preview", action="store_true", help="write _preview.png composite")
     ap.add_argument("--no-depth", action="store_true", help="skip Depth Anything V2")
     ap.add_argument("--no-bg", action="store_true", help="skip writing bg.png (inverse union)")
@@ -359,9 +380,9 @@ def main() -> int:
     final: list[tuple[str, np.ndarray]] = []
     for name, m_excl in exclusive_bool:
         if args.edges == "matting":
-            print(f"[matting] refining {name!r} (band={args.matting_band}px)")
+            print(f"[matting] refining {name!r} (band={args.matting_band}px, algo={args.matting_algo})")
             try:
-                alpha = matting_refine(rgb, m_excl, band_px=args.matting_band)
+                alpha = matting_refine(rgb, m_excl, band_px=args.matting_band, algo=args.matting_algo)
             except ImportError as e:
                 print(f"[matting] unavailable ({e}); falling back to feather", file=sys.stderr)
                 alpha = m_excl

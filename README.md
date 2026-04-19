@@ -119,15 +119,20 @@ SAM 2 pass; adds a few seconds. On by default; skip with `--no-depth`.
 Fast, uniform, content-blind. Good for most cases; leaves halos on
 high-contrast edges and doesn't catch thin filaments.
 
-**matting** — [pymatting](https://pymatting.github.io/) closed-form alpha
-matting. Builds a trimap (erode = known-fg, dilate-inverse = known-bg,
-thin band = unknown), then solves for soft alpha in the unknown band using
-actual image structure. Edge-aware; dramatically better on hair, fur, and
-fine filaments. Slower (seconds per layer).
+**matting** — [pymatting](https://pymatting.github.io/) alpha matting.
+Builds a trimap (erode = known-fg, dilate-inverse = known-bg, thin band =
+unknown), then solves for soft alpha in the unknown band using actual
+image structure. Edge-aware; dramatically better on hair, fur, and fine
+filaments.
 
 `--matting-band` controls the unknown-zone width: narrow (2-4) for tight
 boundaries, medium (8-12) for soft edges and hair, wide (16-24) for wispy
 structures or motion blur.
+
+`--matting-algo` picks the solver: `cf` (default, closed-form — fastest
+and highest quality on typical problems), `lbdm` (approximation for very
+large unknown regions), `knn` (alternative kernel, sometimes useful on
+fur).
 
 ## CSS integration
 

@@ -400,7 +400,7 @@ def on_points_df_change(df_rows, active_layer_name, layers_state):
     return layers_state, _render(layers_state, idx), f"{layer['name']}: {_prompt_summary(layer)}"
 
 
-def on_save(out_dir, edges, feather, matting_band, include_bg, include_css, layers_state):
+def on_save(out_dir, edges, feather, matting_band, matting_algo, include_bg, include_css, layers_state):
     if STATE["rgb"] is None:
         return "No image loaded.", ""
     if not layers_state:
@@ -424,7 +424,7 @@ def on_save(out_dir, edges, feather, matting_band, include_bg, include_css, laye
     for name, m_excl in exclusive:
         if edges == "matting":
             try:
-                alpha = matting_refine(rgb, m_excl, band_px=int(matting_band))
+                alpha = matting_refine(rgb, m_excl, band_px=int(matting_band), algo=matting_algo)
             except ImportError:
                 alpha = m_excl
         else:
@@ -534,6 +534,11 @@ def build_ui(args):
                 with gr.Row():
                     feather = gr.Slider(0, 10, value=2, step=1, label="Feather (px)")
                     matting_band = gr.Slider(2, 24, value=8, step=1, label="Matting band (px)")
+                matting_algo = gr.Dropdown(
+                    ["cf", "lbdm", "knn"], value="cf", label="Matting solver",
+                    info="cf = default (measured fastest + highest quality). "
+                         "lbdm/knn = alternatives for very large unknown regions.",
+                )
                 with gr.Row():
                     include_bg = gr.Checkbox(value=True, label="Write bg.png")
                     include_css = gr.Checkbox(value=True, label="Write snippet.html")
@@ -570,7 +575,7 @@ def build_ui(args):
         points_df.input(on_points_df_change, [points_df, active_layer, layers_state],
                         [layers_state, preview, status])
         save_btn.click(on_save,
-                       [out_dir, edges, feather, matting_band, include_bg, include_css, layers_state],
+                       [out_dir, edges, feather, matting_band, matting_algo, include_bg, include_css, layers_state],
                        [status, css_out])
         export_btn.click(on_export_spec, [layers_state], [spec_out])
 
