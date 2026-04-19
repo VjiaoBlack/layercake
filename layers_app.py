@@ -789,7 +789,8 @@ def build_ui(args):
     with gr.Blocks(title="layercake — SAM 2 interactive") as demo:
         gr.Markdown(
             "# layercake\n"
-            "**SAM 2 photo → depth-ordered transparent PNG layers for CSS compositing.**"
+            "**Photo → depth-ordered transparent PNG layers for CSS compositing.** "
+            "Click-prompt with SAM 2, or describe a concept in text with SAM 3."
         )
         gr.HTML(
             """
