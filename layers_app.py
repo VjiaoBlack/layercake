@@ -487,24 +487,47 @@ def build_ui(args):
     with gr.Blocks(title="layercake — SAM 2 interactive") as demo:
         gr.Markdown(
             "# layercake\n"
-            "Upload → add layers (order = depth, first = nearest) → click points "
-            "(green=include, red=exclude) or draw a box (two clicks) → Save.  \n"
-            "**Tip:** for complex scenes, many small named layers beat cramming many "
-            "points into one. Use Erase to remove the nearest point/box."
+            "**SAM 2 photo → depth-ordered transparent PNG layers for CSS compositing.**"
+        )
+        gr.HTML(
+            """
+            <div style="display:flex; gap:12px; margin:8px 0 16px 0; flex-wrap:wrap;">
+              <div style="flex:1 1 0; min-width:120px; padding:10px 14px; border-radius:10px;
+                          background:var(--panel-background-fill, rgba(127,127,127,0.08));
+                          border:1px solid var(--border-color-primary, rgba(127,127,127,0.25));">
+                <div style="font-size:11px; opacity:0.6; letter-spacing:0.04em;">STEP 1</div>
+                <div style="font-weight:600;">Upload</div>
+              </div>
+              <div style="flex:1 1 0; min-width:120px; padding:10px 14px; border-radius:10px;
+                          background:var(--panel-background-fill, rgba(127,127,127,0.08));
+                          border:1px solid var(--border-color-primary, rgba(127,127,127,0.25));">
+                <div style="font-size:11px; opacity:0.6; letter-spacing:0.04em;">STEP 2</div>
+                <div style="font-weight:600;">Name a layer</div>
+              </div>
+              <div style="flex:1 1 0; min-width:120px; padding:10px 14px; border-radius:10px;
+                          background:var(--panel-background-fill, rgba(127,127,127,0.08));
+                          border:1px solid var(--border-color-primary, rgba(127,127,127,0.25));">
+                <div style="font-size:11px; opacity:0.6; letter-spacing:0.04em;">STEP 3</div>
+                <div style="font-weight:600;">Click points / draw box</div>
+              </div>
+              <div style="flex:1 1 0; min-width:120px; padding:10px 14px; border-radius:10px;
+                          background:var(--panel-background-fill, rgba(127,127,127,0.08));
+                          border:1px solid var(--border-color-primary, rgba(127,127,127,0.25));">
+                <div style="font-size:11px; opacity:0.6; letter-spacing:0.04em;">STEP 4</div>
+                <div style="font-weight:600;">Save</div>
+              </div>
+            </div>
+            <div style="font-size:13px; opacity:0.7; margin-bottom:16px;">
+              Tip — for complex scenes, many small named layers beat cramming many points into one.
+              Use Erase to remove the nearest point/box.
+            </div>
+            """
         )
         layers_state = gr.State([])
 
         with gr.Row():
             with gr.Column(scale=1):
                 image_in = gr.Image(type="pil", label="Source image", height=220)
-                with gr.Row():
-                    model = gr.Dropdown(
-                        ["sam2-hiera-large", "sam2-hiera-base-plus",
-                         "sam2-hiera-small", "sam2-hiera-tiny"],
-                        value=args.model, label="Model",
-                    )
-                    device = gr.Dropdown(["auto", "cpu", "cuda", "mps"],
-                                         value=args.device, label="Device")
 
                 gr.Markdown("### Layers")
                 with gr.Row():
@@ -514,8 +537,8 @@ def build_ui(args):
                 point_mode = gr.Radio(
                     ["include", "exclude", "move", "box", "erase"],
                     value="include", label="Click mode",
-                    info="include/exclude: add point. move: 1st click picks nearest, 2nd drops it. "
-                         "box: two clicks = opposite corners. erase: click near a point/box to remove it.",
+                    info="include/exclude: add point. move: 1st click picks, 2nd drops. "
+                         "box: two clicks = corners. erase: click near a point/box to remove.",
                 )
                 with gr.Row():
                     undo_btn = gr.Button("Undo last")
@@ -535,26 +558,36 @@ def build_ui(args):
                 out_dir = gr.Textbox(value=str(Path.cwd() / "out"), label="Output dir")
                 edges = gr.Radio(
                     ["feather", "matting"], value="feather", label="Edge quality",
-                    info="feather = fast. matting = pymatting closed-form; best on hair/fine edges.",
+                    info="feather = fast. matting = closed-form; best on hair/fine edges.",
                 )
-                with gr.Row():
-                    feather = gr.Slider(0, 10, value=2, step=1, label="Feather (px)")
-                    matting_band = gr.Slider(2, 24, value=8, step=1, label="Matting band (px)")
-                matting_algo = gr.Dropdown(
-                    ["cf", "lbdm", "knn"], value="cf", label="Matting solver",
-                    info="cf = default (measured fastest + highest quality). "
-                         "lbdm/knn = alternatives for very large unknown regions.",
-                )
-                infill = gr.Dropdown(
-                    ["none", "opencv", "lama"], value="none", label="Background infill",
-                    info="none = bg.png is the inverse union. opencv = Navier-Stokes inpaint "
-                         "(instant, best on simple bgs). lama = LaMa model (plausible on complex "
-                         "scenes, downloads ~200MB on first use).",
-                )
+                feather = gr.Slider(0, 10, value=2, step=1, label="Feather (px)")
                 with gr.Row():
                     include_bg = gr.Checkbox(value=True, label="Write bg.png")
                     include_css = gr.Checkbox(value=True, label="Write snippet.html")
-                save_btn = gr.Button("Save layers", variant="primary")
+                save_btn = gr.Button("Save layers", variant="primary", size="lg")
+
+                with gr.Accordion("Advanced", open=False):
+                    with gr.Row():
+                        model = gr.Dropdown(
+                            ["sam2-hiera-large", "sam2-hiera-base-plus",
+                             "sam2-hiera-small", "sam2-hiera-tiny"],
+                            value=args.model, label="Model",
+                        )
+                        device = gr.Dropdown(["auto", "cpu", "cuda", "mps"],
+                                             value=args.device, label="Device")
+                    matting_band = gr.Slider(2, 24, value=8, step=1, label="Matting band (px)",
+                                             info="unknown-region width for --edges matting")
+                    matting_algo = gr.Dropdown(
+                        ["cf", "lbdm", "knn"], value="cf", label="Matting solver",
+                        info="cf = fastest + highest quality on typical problems. "
+                             "lbdm/knn = for very large unknown regions.",
+                    )
+                    infill = gr.Dropdown(
+                        ["none", "opencv", "lama"], value="none", label="Background infill",
+                        info="none = transparent. opencv = Navier-Stokes (instant, simple bgs). "
+                             "lama = LaMa model (plausible on complex, ~200MB first use).",
+                    )
+
                 export_btn = gr.Button("Show points.json")
                 spec_out = gr.Code(label="points.json", language="json")
                 css_out = gr.Code(label="CSS snippet", language="html")
