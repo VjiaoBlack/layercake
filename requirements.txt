@@ -12,7 +12,8 @@ torchvision>=0.19
 
 # SAM 2 — Meta official. Pulls hydra-core, iopath, etc. as transitive deps.
 # Weights auto-download from HF (facebook/sam2-hiera-large) on first call.
-sam2 @ git+https://github.com/facebookresearch/sam2.git@main
+# NOTE: package declares itself as `sam-2` in its pyproject; uv needs the dash.
+sam-2 @ git+https://github.com/facebookresearch/sam2.git@main
 
 # Depth Anything V2 + SAM 3 (via HF transformers). SAM 3 needs recent
 # transformers with Sam3Model/Sam3Processor — bump if yours is older.
