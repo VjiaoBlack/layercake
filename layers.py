@@ -82,6 +82,24 @@ def autocast_ctx(device: str):
     return nullcontext()
 
 
+def bool_mask_to_sam2_prior(mask: np.ndarray, strength: float = 5.0) -> np.ndarray:
+    """
+    Convert a full-resolution bool mask into SAM 2's mask_input format —
+    a (1, 256, 256) float32 array in logit space. Used to seed SAM 2's
+    `predict(mask_input=...)` with a prior from SAM 3 (Level 2 chaining):
+    SAM 3's concept mask becomes a warm start that subsequent SAM 2 click
+    prompts refine instead of replacing.
+
+    `strength` controls how heavily the prior biases SAM 2. 5.0 is moderate
+    (clicks can still meaningfully modify the mask); 10.0+ locks the prior;
+    2-3 is a softer suggestion.
+    """
+    pil = Image.fromarray((mask.astype(np.uint8)) * 255, mode="L")
+    resized = np.asarray(pil.resize((256, 256), Image.BILINEAR)).astype(np.float32) / 255.0
+    logits = np.where(resized > 0.5, strength, -strength).astype(np.float32)
+    return logits[None, ...]  # shape (1, 256, 256)
+
+
 def load_sam2_predictor(model: str, device: str):
     """Load SAM 2 image predictor. Weights auto-download from HF on first run."""
     from sam2.sam2_image_predictor import SAM2ImagePredictor

@@ -29,6 +29,7 @@ from PIL import Image, ImageDraw
 from layers import (
     _coerce_alpha,
     autocast_ctx,
+    bool_mask_to_sam2_prior,
     build_css_snippet,
     detect_device,
     infill_background,
@@ -86,37 +87,56 @@ def _new_layer(name: str) -> dict:
     # SAM 2 returns 3 candidate masks per predict() call at subpart/part/whole
     # scale. We store all of them so the user can cycle through alternates.
     # refined_regions: list of {"box": [x1,y1,x2,y2], "alpha": np.ndarray}
+    # mask_prior: bool HxW mask from SAM 3 that seeds SAM 2 click refinement
+    #   (Level 2 chaining). None = pure SAM 2 click path.
     return {
         "name": name, "points": [], "labels": [], "box": None,
         "history": [], "refined_regions": [],
         "candidates": [], "candidate_scores": [], "active_candidate": 0,
+        "mask_prior": None, "prior_source": None,
     }
 
 
 def _segment(layer: dict) -> Optional[np.ndarray]:
     """
-    Run SAM 2 on an active layer's prompts. Populates `layer["candidates"]` with
-    all three scale-variant masks (sorted by score, highest first). Returns the
-    currently-active candidate, or None if nothing to segment.
+    Run SAM 2 on an active layer's prompts, returning the active mask.
+
+    Level 2 chaining: if the layer has a `mask_prior` (populated by SAM 3
+    concept segmentation), it's passed to SAM 2 via `mask_input` so click
+    prompts refine the SAM 3 mask instead of replacing it.
     """
-    if not layer["points"] and layer["box"] is None:
+    prior = layer.get("mask_prior")
+    has_pts = bool(layer["points"])
+    has_box = layer["box"] is not None
+
+    # No new click prompts: just use the prior as-is (SAM 3 output stands).
+    if not has_pts and not has_box:
+        if prior is not None:
+            layer["candidates"] = [prior]
+            layer["candidate_scores"] = [1.0]
+            layer["active_candidate"] = 0
+            return prior
         layer["candidates"] = []
         layer["candidate_scores"] = []
         layer["active_candidate"] = 0
         return None
+
     predictor = STATE["predictor"]
-    pts = np.asarray(layer["points"], dtype=np.float32) if layer["points"] else None
-    lbls = np.asarray(layer["labels"], dtype=np.int32) if layer["points"] else None
-    box = np.asarray(layer["box"], dtype=np.float32) if layer["box"] is not None else None
+    pts = np.asarray(layer["points"], dtype=np.float32) if has_pts else None
+    lbls = np.asarray(layer["labels"], dtype=np.int32) if has_pts else None
+    box = np.asarray(layer["box"], dtype=np.float32) if has_box else None
+    mask_input = bool_mask_to_sam2_prior(prior) if prior is not None else None
+
     with autocast_ctx(STATE["device_resolved"]):
         masks, scores, _ = predictor.predict(
-            point_coords=pts, point_labels=lbls, box=box, multimask_output=True,
+            point_coords=pts, point_labels=lbls, box=box,
+            mask_input=mask_input,
+            multimask_output=True,
         )
-    order = np.argsort(-np.asarray(scores))  # best first
+    order = np.argsort(-np.asarray(scores))
     layer["candidates"] = [np.asarray(masks[i]).astype(bool) for i in order]
     layer["candidate_scores"] = [float(scores[i]) for i in order]
-    # Reset to best candidate whenever prompts change — the previous alternate
-    # index may not mean the same thing under a new prompt set.
+    # Reset to best candidate when prompts change.
     layer["active_candidate"] = 0
     return layer["candidates"][0]
 
@@ -378,10 +398,23 @@ def on_clear_points(active_layer_name, layers_state):
     idx = _find_idx(layers_state, active_layer_name)
     if idx < 0:
         return layers_state, _render(layers_state, -1), "No active layer.", []
-    layers_state[idx].update(points=[], labels=[], box=None, history=[], refined_regions=[])
-    STATE["cached_masks"].pop(active_layer_name, None)
+    layer = layers_state[idx]
+    had_prior = layer.get("mask_prior") is not None
+    layer.update(points=[], labels=[], box=None, history=[], refined_regions=[])
     STATE["pending_box_corner"] = None
-    return layers_state, _render(layers_state, idx), f"Cleared {active_layer_name!r}.", []
+    # Preserve the SAM 3 prior: "clear" means reset refinements, not drop the
+    # concept-segmentation starting point. To drop the prior entirely, remove
+    # the layer.
+    if had_prior:
+        layer["candidates"] = [layer["mask_prior"]]
+        layer["candidate_scores"] = [1.0]
+        layer["active_candidate"] = 0
+        STATE["cached_masks"][active_layer_name] = layer["mask_prior"]
+        msg = f"Cleared refinements on {active_layer_name!r} — reset to SAM 3 mask."
+    else:
+        STATE["cached_masks"].pop(active_layer_name, None)
+        msg = f"Cleared {active_layer_name!r}."
+    return layers_state, _render(layers_state, idx), msg, []
 
 
 def on_image_click(evt: gr.SelectData, mode, active_layer_name, layers_state):
@@ -599,12 +632,14 @@ def on_concept_segment(concept_text, device, base_name, score_thresh, layers_sta
             n += 1
             name = f"{base}-{i}-{n}"
         existing.add(name)
-        layers_state = layers_state + [{
-            "name": name, "points": [], "labels": [], "box": None,
-            "history": [], "refined_regions": [],
-            "candidates": [r["mask"]], "candidate_scores": [r["score"]],
-            "active_candidate": 0,
-        }]
+        layer = _new_layer(name)
+        # Store SAM 3's mask as both the initial candidate and the prior so
+        # future SAM 2 click prompts refine it rather than replacing it.
+        layer["candidates"] = [r["mask"]]
+        layer["candidate_scores"] = [r["score"]]
+        layer["mask_prior"] = r["mask"]
+        layer["prior_source"] = "sam3"
+        layers_state = layers_state + [layer]
         STATE["cached_masks"][name] = r["mask"]
         created.append((name, r["score"]))
 
