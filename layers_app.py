@@ -71,8 +71,10 @@ def _load_predictor(model: str, device: str):
 
 
 def _new_layer(name: str) -> dict:
+    # refined_regions: list of {"box": [x1,y1,x2,y2], "alpha": np.ndarray}
+    # Each region carries a soft alpha in box-local coords; applied at save time.
     return {"name": name, "points": [], "labels": [], "box": None,
-            "history": []}  # history entries: ("point", idx) | ("box", prev_box)
+            "history": [], "refined_regions": []}
 
 
 def _segment(layer: dict) -> Optional[np.ndarray]:
@@ -117,6 +119,11 @@ def _render(layers_state: list[dict], active_idx: int) -> Optional[np.ndarray]:
             x1, y1, x2, y2 = layer["box"]
             draw.rectangle((x1, y1, x2, y2),
                            outline=(255, 220, 60, 255), width=max(2, r // 2))
+        for region in layer.get("refined_regions", []):
+            x1, y1, x2, y2 = region["box"]
+            # Cyan outline: "this region has been edge-refined"
+            draw.rectangle((x1, y1, x2, y2),
+                           outline=(80, 220, 220, 255), width=max(2, r // 2))
         if STATE["pending_box_corner"] is not None:
             x, y = STATE["pending_box_corner"]
             draw.ellipse((x - r, y - r, x + r, y + r),
@@ -146,6 +153,43 @@ def _compute_preview_scale(W: int, H: int) -> float:
     if longest <= PREVIEW_MAX_DIM:
         return 1.0
     return PREVIEW_MAX_DIM / float(longest)
+
+
+REFINE_BAND_PX = 12
+REFINE_PAD_PX = 8  # pad the crop so matting has room for a trimap band
+
+
+def _refine_region(layer: dict, box: list[float]) -> Optional[dict]:
+    """
+    Run matting on a crop of this layer's hard mask inside `box`. Returns a
+    dict {box, alpha} to append to layer["refined_regions"], or None if the
+    layer has no mask yet or the box is degenerate.
+    """
+    mask = STATE["cached_masks"].get(layer["name"])
+    rgb = STATE["rgb"]
+    if mask is None or rgb is None:
+        return None
+    H, W, _ = rgb.shape
+    x1, y1, x2, y2 = [int(round(v)) for v in box]
+    # Snap + pad
+    x1 = max(0, min(W - 1, x1 - REFINE_PAD_PX))
+    y1 = max(0, min(H - 1, y1 - REFINE_PAD_PX))
+    x2 = max(0, min(W, x2 + REFINE_PAD_PX))
+    y2 = max(0, min(H, y2 + REFINE_PAD_PX))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    rgb_crop = rgb[y1:y2, x1:x2]
+    mask_crop = mask[y1:y2, x1:x2]
+    # If the crop has no foreground at all, nothing to refine.
+    if not mask_crop.any():
+        return None
+    try:
+        from layers import matting_refine
+        alpha_crop = matting_refine(rgb_crop, mask_crop, band_px=REFINE_BAND_PX, algo="cf")
+    except Exception as e:
+        print(f"[refine] matting failed on {layer['name']!r} crop: {e}")
+        return None
+    return {"box": [x1, y1, x2, y2], "alpha": alpha_crop.astype(np.float32)}
 
 
 def _find_idx(layers_state: list[dict], name: Optional[str]) -> int:
@@ -263,7 +307,7 @@ def on_clear_points(active_layer_name, layers_state):
     idx = _find_idx(layers_state, active_layer_name)
     if idx < 0:
         return layers_state, _render(layers_state, -1), "No active layer.", []
-    layers_state[idx].update(points=[], labels=[], box=None, history=[])
+    layers_state[idx].update(points=[], labels=[], box=None, history=[], refined_regions=[])
     STATE["cached_masks"].pop(active_layer_name, None)
     STATE["pending_box_corner"] = None
     return layers_state, _render(layers_state, idx), f"Cleared {active_layer_name!r}.", []
@@ -304,6 +348,25 @@ def on_image_click(evt: gr.SelectData, mode, active_layer_name, layers_state):
             layer["history"].append(("box", prev_box))
             _recompute(layer)
             msg = f"{layer['name']}: box set — {_prompt_summary(layer)}"
+    elif mode == "refine":
+        if STATE["pending_box_corner"] is None:
+            STATE["pending_box_corner"] = [x, y]
+            msg = f"{layer['name']}: refine — click opposite corner of the region to fine-tune."
+        else:
+            px, py = STATE["pending_box_corner"]
+            STATE["pending_box_corner"] = None
+            rbox = [float(min(px, x)), float(min(py, y)),
+                    float(max(px, x)), float(max(py, y))]
+            region = _refine_region(layer, rbox)
+            if region is None:
+                msg = (f"{layer['name']}: refine skipped (segment this layer with "
+                       "points/box first, or draw a larger refine box).")
+            else:
+                layer.setdefault("refined_regions", []).append(region)
+                layer["history"].append(("refine", None))
+                cy, cx = region["alpha"].shape
+                msg = (f"{layer['name']}: refined {cx}×{cy} px region with "
+                       f"band={REFINE_BAND_PX}px. Cyan outline in preview.")
     elif mode == "move":
         thresh = max(W, H) / 40.0
         sel = STATE["move_selected"]
@@ -364,6 +427,9 @@ def on_undo(active_layer_name, layers_state):
         layer["box"] = data
     elif kind == "box-removed":
         layer["box"] = data
+    elif kind == "refine":
+        if layer.get("refined_regions"):
+            layer["refined_regions"].pop()
     STATE["pending_box_corner"] = None
     _recompute(layer)
     return layers_state, _render(layers_state, idx), f"Undo — {_prompt_summary(layer)}", _layer_to_df(layer)
@@ -403,9 +469,9 @@ def on_points_df_change(df_rows, active_layer_name, layers_state):
 
 def on_save(out_dir, edges, feather, matting_band, matting_algo, infill, include_bg, include_css, layers_state):
     if STATE["rgb"] is None:
-        return "No image loaded.", ""
+        return "No image loaded.", "", None
     if not layers_state:
-        return "No layers to save.", ""
+        return "No layers to save.", "", None
     out = Path(out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     rgb = STATE["rgb"]
@@ -421,6 +487,9 @@ def on_save(out_dir, edges, feather, matting_band, matting_algo, infill, include
         exclusive.append((L["name"], m_excl))
         claimed |= m
 
+    # Index layers by name to look up refined regions.
+    layer_by_name = {L["name"]: L for L in layers_state}
+
     finals = []
     for name, m_excl in exclusive:
         if edges == "matting":
@@ -430,6 +499,18 @@ def on_save(out_dir, edges, feather, matting_band, matting_algo, infill, include
                 alpha = m_excl
         else:
             alpha = m_excl
+        # Apply per-region refinements (local matting overrides).
+        regions = layer_by_name.get(name, {}).get("refined_regions", [])
+        if regions:
+            alpha_f = _coerce_alpha(alpha).copy()
+            for region in regions:
+                x1, y1, x2, y2 = [int(v) for v in region["box"]]
+                refined = region["alpha"]
+                # Clip the refined alpha to this layer's exclusive territory so
+                # a refine box can't steal pixels from a nearer layer.
+                excl_crop = m_excl[y1:y2, x1:x2].astype(np.float32)
+                alpha_f[y1:y2, x1:x2] = refined * excl_crop
+            alpha = alpha_f
         finals.append((name, alpha))
 
     written = []
@@ -468,9 +549,22 @@ def on_save(out_dir, edges, feather, matting_band, matting_algo, infill, include
         (out / "snippet.html").write_text(css)
         written.append("snippet.html")
 
+    # Build inline output composite: stack bg + layers in depth order
+    # (back-to-front so nearest layer lands on top).
+    composite = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if include_bg and (out / "bg.png").exists():
+        composite = Image.alpha_composite(
+            composite, Image.open(out / "bg.png").convert("RGBA"),
+        )
+    for name, _ in reversed(finals):
+        p = out / f"{name}.png"
+        if p.exists():
+            composite = Image.alpha_composite(composite, Image.open(p).convert("RGBA"))
+    composite_np = np.asarray(composite.convert("RGB"))
+
     status = (f"Saved {len(written)} file(s) at {W}×{H} → `{out}`\n"
               f"Files: {', '.join(written)}\nSpec: points.json\nEdges: {edges}")
-    return status, css
+    return status, css, composite_np
 
 
 def on_export_spec(layers_state):
@@ -535,10 +629,11 @@ def build_ui(args):
                     add_btn = gr.Button("Add layer", scale=1)
                 active_layer = gr.Dropdown(choices=[], label="Active layer")
                 point_mode = gr.Radio(
-                    ["include", "exclude", "move", "box", "erase"],
+                    ["include", "exclude", "move", "box", "refine", "erase"],
                     value="include", label="Click mode",
                     info="include/exclude: add point. move: 1st click picks, 2nd drops. "
-                         "box: two clicks = corners. erase: click near a point/box to remove.",
+                         "box: two clicks = corners. refine: two clicks = region to fine-tune "
+                         "the edge via local matting. erase: remove nearest point/box.",
                 )
                 with gr.Row():
                     undo_btn = gr.Button("Undo last")
@@ -601,6 +696,12 @@ def build_ui(args):
                     elem_classes=["big-preview"],
                 )
                 status = gr.Markdown("Upload an image to begin.")
+                output_composite = gr.Image(
+                    label="Output composite (how the CSS stack will render — updates on Save)",
+                    type="numpy",
+                    format="png",
+                    interactive=False,
+                )
 
         image_in.change(on_upload, [image_in, model, device, layers_state],
                         [preview, layers_state, active_layer, status, points_df])
@@ -622,7 +723,7 @@ def build_ui(args):
         save_btn.click(on_save,
                        [out_dir, edges, feather, matting_band, matting_algo, infill,
                         include_bg, include_css, layers_state],
-                       [status, css_out])
+                       [status, css_out, output_composite])
         export_btn.click(on_export_spec, [layers_state], [spec_out])
 
     return demo
