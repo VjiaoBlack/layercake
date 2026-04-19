@@ -66,6 +66,22 @@ def detect_device(requested: str) -> str:
     return "cpu"
 
 
+def autocast_ctx(device: str):
+    """
+    fp16 autocast on MPS/CUDA ~halves SAM 2 encoder + predict latency with no
+    visible mask-quality cost. No-op on CPU (fp16 CPU kernels are marginal).
+    """
+    import torch
+    from contextlib import nullcontext
+
+    if device in ("mps", "cuda"):
+        try:
+            return torch.autocast(device_type=device, dtype=torch.float16)
+        except (RuntimeError, TypeError):
+            return nullcontext()
+    return nullcontext()
+
+
 def load_sam2_predictor(model: str, device: str):
     """Load SAM 2 image predictor. Weights auto-download from HF on first run."""
     from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -102,13 +118,16 @@ def segment_layer(
         lbls = None
     box = np.asarray(layer.box, dtype=np.float32) if layer.box is not None else None
 
-    masks, scores, _ = predictor.predict(
-        point_coords=pts,
-        point_labels=lbls,
-        box=box,
-        multimask_output=True,
-        return_logits=return_soft,
-    )
+    device = getattr(predictor, "device", None)
+    device_str = str(device).split(":")[0] if device else "cpu"
+    with autocast_ctx(device_str):
+        masks, scores, _ = predictor.predict(
+            point_coords=pts,
+            point_labels=lbls,
+            box=box,
+            multimask_output=True,
+            return_logits=return_soft,
+        )
     best = int(np.argmax(scores))
     m = np.asarray(masks[best])
     if m.shape != (H, W):

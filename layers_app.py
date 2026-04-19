@@ -28,6 +28,7 @@ from PIL import Image, ImageDraw
 
 from layers import (
     _coerce_alpha,
+    autocast_ctx,
     build_css_snippet,
     detect_device,
     load_sam2_predictor,
@@ -81,9 +82,10 @@ def _segment(layer: dict) -> Optional[np.ndarray]:
     pts = np.asarray(layer["points"], dtype=np.float32) if layer["points"] else None
     lbls = np.asarray(layer["labels"], dtype=np.int32) if layer["points"] else None
     box = np.asarray(layer["box"], dtype=np.float32) if layer["box"] is not None else None
-    masks, scores, _ = predictor.predict(
-        point_coords=pts, point_labels=lbls, box=box, multimask_output=True,
-    )
+    with autocast_ctx(STATE["device_resolved"]):
+        masks, scores, _ = predictor.predict(
+            point_coords=pts, point_labels=lbls, box=box, multimask_output=True,
+        )
     best = int(np.argmax(scores))
     return np.asarray(masks[best]).astype(bool)
 
@@ -218,7 +220,8 @@ def on_upload(image, model, device, _layers_state):
         return gr.update(), [], gr.update(choices=[], value=None), "No image.", []
     rgb = np.asarray(image.convert("RGB"))
     predictor, device_resolved = _load_predictor(model, device)
-    predictor.set_image(rgb)
+    with autocast_ctx(device_resolved):
+        predictor.set_image(rgb)
     STATE["rgb"] = rgb
     STATE["cached_masks"] = {}
     STATE["pending_box_corner"] = None
